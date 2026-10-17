@@ -1,4 +1,5 @@
-import random, math
+import math
+import random
 
 def think_time_ms(remaining_ms: int, median_ms: int, sigma: float,
                   move_min_ms: int, max_clock_fraction: float,
