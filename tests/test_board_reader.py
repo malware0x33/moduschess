@@ -19,6 +19,17 @@ def test_empty():
 def test_castle_tokens():
     # I1/I2: all castle spellings must tokenize fully (0-0 was skipped).
     assert extract_moves("O-O O-O-O 0-0") == ["O-O", "O-O-O", "0-0"]
+    # I4: check/mate suffixes must stay on castle tokens.
+    assert extract_moves("O-O+") == ["O-O+"]
+    assert extract_moves("O-O-O+") == ["O-O-O+"]
+    assert extract_moves("O-O#") == ["O-O#"]
+    assert extract_moves("0-0+") == ["0-0+"]
+
+def test_castle_check_suffix_pushes():
+    # I4: suffixed castles must tokenize fully, normalize 0->O (suffix kept), push.
+    # Same line as test_zero_castle_pushes; suffixes don't change the moves.
+    board = moves_to_board("e4 e5 Nf3 Nc6 Nc3 Nf6 Bb5 Bc5 O-O+ 0-0+")
+    assert board.fen() == "r1bq1rk1/pppp1ppp/2n2n2/1Bb1p3/4P3/2N2N2/PPPP1PPP/R1BQ1RK1 w - - 8 6"
 
 def test_zero_castle_pushes():
     # I2: 0-0 must normalize to O-O and push; rights end up "-" after both castle.

@@ -4,7 +4,7 @@ import re
 import chess
 
 SAN_RE = re.compile(
-    r"\b([KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?|[O0]-[O0](?:-[O0])?)(?![\w=+#])"
+    r"\b([KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?|[O0]-[O0](?:-[O0])?[+#]?)(?![\w=+#])"
 )
 
 def extract_moves(html: str) -> list[str]:
@@ -19,7 +19,7 @@ def moves_to_board(html: str) -> chess.Board:
     """
     board = chess.Board()
     for index, san in enumerate(extract_moves(html)):
-        if re.fullmatch(r"[O0]-[O0](?:-[O0])?", san):
+        if re.fullmatch(r"[O0]-[O0](?:-[O0])?[+#]?", san):
             san = san.replace("0", "O")
         try:
             board.push_san(san)
