@@ -4,11 +4,10 @@ import random
 def think_time_ms(remaining_ms: int, median_ms: int, sigma: float,
                   move_min_ms: int, max_clock_fraction: float,
                   rng: random.Random | None = None) -> int:
-    """Lognormal think time, hard-capped at max_clock_fraction of the clock.
-
+    """Log normal think time, capped at max_clock_fraction of the clock.
     Resamples up to 50 times to stay within [min(move_min_ms, cap), cap]
-    (avoiding the clamp point-mass); falls back to a uniform draw in that
-    range. cap wins over the floor when the clock is short - never flags.
+    (avoiding the clamp point mass); falls back to a uniform draw in that
+    range. cap wins over the floor when the clock is short, never flags.
     """
     rng = rng or random.Random()
     cap = int(remaining_ms * max_clock_fraction)

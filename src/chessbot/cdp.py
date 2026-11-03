@@ -1,9 +1,14 @@
 """Minimal CDP client: attach to a Chrome tab, evaluate JS, dispatch clicks."""
 
 import asyncio
+from dataclasses import dataclass
 import json
+import os
+from pathlib import Path
+import random
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import websockets
@@ -11,25 +16,104 @@ import websockets
 RPC_TIMEOUT_S = 30
 
 
+@dataclass(frozen=True)
+class BrowserConnection:
+    """Browser-scoped WebSocket plus the page URL it should attach to."""
+
+    ws_url: str
+    url_regex: str
+
+
+# Runtime.evaluate executes in the page's JavaScript context. Normal CSS
+# selectors stop at a shadow boundary, so every DOM probe uses these helpers
+# to traverse the document plus all nested *open* shadow roots.
+SHADOW_QUERY_JS = """
+  const collectRoots = (start = document) => {
+    const roots = [start];
+    if (start.shadowRoot) roots.push(start.shadowRoot);
+    for (let index = 0; index < roots.length; index += 1) {
+      for (const element of roots[index].querySelectorAll('*')) {
+        if (element.shadowRoot) roots.push(element.shadowRoot);
+      }
+    }
+    return roots;
+  };
+  const queryFirstFromRoots = (selector, roots) => {
+    for (const root of roots) {
+      const match = root.querySelector(selector);
+      if (match) return match;
+    }
+    return null;
+  };
+  const queryAllFromRoots = (selector, roots) =>
+    roots.flatMap(root => [...root.querySelectorAll(selector)]);
+  const queryDeep = (selector, start = document) => {
+    return queryFirstFromRoots(selector, collectRoots(start));
+  };
+  const queryAllDeep = (selector, start = document) =>
+    queryAllFromRoots(selector, collectRoots(start));
+"""
+
+
 class Tab:
-    """A websocket connection to a single Chrome tab's CDP endpoint.
+    """A direct tab connection or browser-scoped attached CDP session.
 
     Contract: use one Tab sequentially from a single async task. Concurrent
     _rpc calls would cross-steal each other's responses, because responses
     are only matched against the most recently sent request id.
     """
 
-    def __init__(self, ws_url: str):
-        self.ws_url = ws_url
+    def __init__(self, connection: str | BrowserConnection):
+        if isinstance(connection, BrowserConnection):
+            self.ws_url = connection.ws_url
+            self._target_url_regex = connection.url_regex
+        else:
+            self.ws_url = connection
+            self._target_url_regex = None
         self._ws = None
         self._id = 0
+        self._session_id = None
 
     async def __aenter__(self) -> "Tab":
         self._ws = await websockets.connect(self.ws_url, max_size=50_000_000)
-        return self
+        try:
+            if self._target_url_regex is not None:
+                await self._attach_matching_page(self._target_url_regex)
+            return self
+        except BaseException:
+            await self._ws.close()
+            self._ws = None
+            raise
 
     async def __aexit__(self, *exc):
-        await self._ws.close()
+        if self._ws is not None:
+            await self._ws.close()
+
+    async def _attach_matching_page(self, url_regex: str) -> None:
+        """Attach a flattened session to the first matching page target."""
+        result = await self._rpc("Target.getTargets")
+        target = next(
+            (
+                info
+                for info in result.get("targetInfos", [])
+                if info.get("type") == "page"
+                and re.search(url_regex, info.get("url", ""))
+            ),
+            None,
+        )
+        if target is None:
+            raise RuntimeError(
+                "no matching Chess.com tab - open Home, Play, "
+                "or a live game"
+            )
+        attached = await self._rpc(
+            "Target.attachToTarget",
+            {"targetId": target["targetId"], "flatten": True},
+        )
+        session_id = attached.get("sessionId")
+        if not session_id:
+            raise RuntimeError("Chrome did not return a CDP target session")
+        self._session_id = session_id
 
     async def _rpc(self, method: str, params: dict | None = None):
         """Send one CDP command and return its matching result object.
@@ -40,7 +124,10 @@ class Tab:
         matching response arrives within RPC_TIMEOUT_S seconds.
         """
         self._id += 1
-        await self._ws.send(json.dumps({"id": self._id, "method": method, "params": params or {}}))
+        request = {"id": self._id, "method": method, "params": params or {}}
+        if self._session_id is not None:
+            request["sessionId"] = self._session_id
+        await self._ws.send(json.dumps(request))
         try:
             async with asyncio.timeout(RPC_TIMEOUT_S):
                 while True:
@@ -70,7 +157,17 @@ class Tab:
         return res.get("result", {}).get("value")
 
     async def click(self, x: float, y: float):
-        """Dispatch a left-button press+release at viewport coords (x, y)."""
+        """Dispatch a trusted hover+press+release at viewport coords (x, y).
+
+        A small per-click offset keeps repeated clicks off the exact same
+        pixel (a human never clicks identical coordinates twice), and a
+        mouseMoved precedes every press the way real pointer input does.
+        """
+        x += random.uniform(-8.0, 8.0)
+        y += random.uniform(-8.0, 8.0)
+        await self._rpc(
+            "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}
+        )
         for t in ("mousePressed", "mouseReleased"):
             await self._rpc(
                 "Input.dispatchMouseEvent",
@@ -78,11 +175,85 @@ class Tab:
             )
 
 
-def find_tab(devtools_url: str, url_regex: str) -> str | None:
-    """Return the webSocketDebuggerUrl of the first page tab matching url_regex."""
+def _devtools_active_port_path() -> Path:
+    """Return Chrome Stable's permission-mode endpoint file on Windows."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        raise RuntimeError(
+            "LOCALAPPDATA is unavailable; cannot locate Chrome's "
+            "DevToolsActivePort file"
+        )
+    return (
+        Path(local_app_data)
+        / "Google"
+        / "Chrome"
+        / "User Data"
+        / "DevToolsActivePort"
+    )
+
+
+def _permission_browser_connection(
+    devtools_url: str,
+    url_regex: str,
+) -> BrowserConnection:
+    """Build a browser connection from Chrome's permission-mode endpoint."""
+    parsed = urllib.parse.urlparse(devtools_url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }:
+        raise RuntimeError(
+            "Chrome's default-profile connection is supported only for a "
+            "local loopback CDP URL"
+        )
+    expected_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    active_port_path = _devtools_active_port_path()
+    try:
+        lines = active_port_path.read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        raise RuntimeError(
+            "Chrome's HTTP endpoint is hidden and DevToolsActivePort could not "
+            "be read; enable Remote debugging at "
+            "chrome://inspect/#remote-debugging"
+        ) from e
+    if len(lines) < 2:
+        raise RuntimeError("Chrome's DevToolsActivePort file is incomplete")
+    try:
+        reported_port = int(lines[0].strip())
+    except ValueError as e:
+        raise RuntimeError(
+            "Chrome's DevToolsActivePort contains an invalid port"
+        ) from e
+    if reported_port != expected_port:
+        raise RuntimeError(
+            f"Chrome's DevToolsActivePort reports port {reported_port}, "
+            f"but Chessbot is configured for {expected_port}"
+        )
+    browser_path = lines[1].strip()
+    if not browser_path.startswith("/devtools/browser/"):
+        raise RuntimeError(
+            "Chrome's DevToolsActivePort contains an invalid WebSocket path"
+        )
+    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+    host = parsed.hostname
+    if ":" in host:
+        host = f"[{host}]"
+    return BrowserConnection(
+        ws_url=f"{ws_scheme}://{host}:{reported_port}{browser_path}",
+        url_regex=url_regex,
+    )
+
+
+def find_tab(devtools_url: str, url_regex: str) -> str | BrowserConnection | None:
+    """Find a page endpoint using legacy HTTP or Chrome permission mode."""
     url = devtools_url.rstrip("/") + "/json"
     try:
         tabs = json.loads(urllib.request.urlopen(url, timeout=5).read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return _permission_browser_connection(devtools_url, url_regex)
+        raise RuntimeError(f"Chrome devtools returned HTTP {e.code}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(
             "cannot reach Chrome devtools - is Chrome running with --remote-debugging-port=9222?"
