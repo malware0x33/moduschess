@@ -24,7 +24,7 @@ Install the runtime dependencies:
 
 Confirm that the command-line entry point is available:
 
-- .\.venv\Scripts\python.exe .\main.py --help
+- .\.venv\Scripts\python.exe main.py -v
 
 
 Starting the browser
