@@ -1,6 +1,7 @@
 ModusChess watches a Chess.com tab from the Home or Play pages, detects when a live game begins reconstructs the position from the move list, asks
 Stockfish for moves, waits for a "clock aware" randomised think time, and  plays a move through the Chrome DevTools Protocol (CDP). After a game ends it reports the result and waits for the next game.
 
+Written for educational purposes only. I do not codone cheating of any kind.
 
 Reqs:
 
