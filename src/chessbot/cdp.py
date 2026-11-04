@@ -14,6 +14,16 @@ import urllib.request
 import websockets
 
 RPC_TIMEOUT_S = 30
+SESSION_NOT_FOUND_CODE = -32001
+
+
+class CDPError(RuntimeError):
+    """A structured Chrome DevTools Protocol error response."""
+
+    def __init__(self, error):
+        self.error = error
+        self.code = error.get("code") if isinstance(error, dict) else None
+        super().__init__(f"CDP error: {error}")
 
 
 @dataclass(frozen=True)
@@ -73,6 +83,11 @@ class Tab:
         self._ws = None
         self._id = 0
         self._session_id = None
+
+    @property
+    def supports_session_recovery(self) -> bool:
+        """Return whether this tab uses a reattachable browser session."""
+        return self._target_url_regex is not None
 
     async def __aenter__(self) -> "Tab":
         self._ws = await websockets.connect(self.ws_url, max_size=50_000_000)
@@ -134,7 +149,7 @@ class Tab:
                     msg = json.loads(await self._ws.recv())
                     if msg.get("id") == self._id:
                         if "error" in msg:
-                            raise RuntimeError(f"CDP error: {msg['error']}")
+                            raise CDPError(msg["error"])
                         return msg.get("result", {})
         except asyncio.TimeoutError:
             raise RuntimeError(f"CDP RPC timed out: {method}") from None
@@ -145,10 +160,28 @@ class Tab:
         Raises RuntimeError if the evaluation throws, via the
         exceptionDetails CDP reports inside the Runtime.evaluate result.
         """
-        res = await self._rpc(
-            "Runtime.evaluate",
-            {"expression": expression, "returnByValue": True, "awaitPromise": True},
-        )
+        params = {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        }
+        try:
+            res = await self._rpc("Runtime.evaluate", params)
+        except CDPError as error:
+            if (
+                error.code != SESSION_NOT_FOUND_CODE
+                or not self.supports_session_recovery
+                or self._session_id is None
+            ):
+                raise
+
+            # A flattened target session can disappear while the browser-level
+            # WebSocket remains healthy. Reattach without the stale session id
+            # and replay only this read-only evaluation once. Input commands
+            # deliberately do not use this recovery path.
+            self._session_id = None
+            await self._attach_matching_page(self._target_url_regex)
+            res = await self._rpc("Runtime.evaluate", params)
         if res.get("exceptionDetails"):
             raise RuntimeError(
                 f"eval_js failed: "

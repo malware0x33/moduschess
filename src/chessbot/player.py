@@ -7,13 +7,20 @@ import time
 
 import chess
 
-from chessbot.cdp import BrowserConnection, Tab, find_tab
+from chessbot.cdp import (
+    BrowserConnection,
+    CDPError,
+    SESSION_NOT_FOUND_CODE,
+    Tab,
+    find_tab,
+)
 from chessbot.config import CONFIG
 from chessbot.clock import read_clock_ms
 from chessbot.engine import StockfishPolicy
 from chessbot.humanizer import think_time_ms
 from chessbot.mover import square_to_xy
 from chessbot.state import (
+    BrowserState,
     CLICK_ACK_TIMEOUT_S,
     GET_STATE_JS,
     GamePhase,
@@ -48,6 +55,148 @@ def sample_move(ranked: list[tuple[chess.Move, int]], temperature_cp: int) -> ch
         for _, score in ranked
     ]
     return random.choices([move for move, _ in ranked], weights=weights, k=1)[0]
+
+
+def _validated_click_board(
+    snapshot: BrowserState | None,
+    expected: BrowserState,
+    color: chess.Color,
+    move: chess.Move,
+) -> chess.Board | None:
+    """Return a current, safe-to-click board or ``None`` if it changed."""
+    if not snapshot:
+        return None
+    if not bool(snapshot.get("board_present", "rect" in snapshot)):
+        return None
+    if snapshot.get("game_over"):
+        return None
+    if (
+        snapshot.get("url") != expected.get("url")
+        or snapshot.get("moves") != expected.get("moves")
+        or snapshot.get("move_count") != expected.get("move_count")
+    ):
+        return None
+
+    rect = snapshot.get("rect")
+    if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+        return None
+    try:
+        x, y, width, height = (float(value) for value in rect)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x, y, width, height)):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+
+    try:
+        board = board_from_state(snapshot)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if board.is_game_over() or board.turn != color or move not in board.legal_moves:
+        return None
+    return board
+
+
+async def _recover_click_board(
+    tab: Tab,
+    expected: BrowserState,
+    color: chess.Color,
+    move: chess.Move,
+) -> tuple[BrowserState, chess.Board]:
+    """Recover the CDP session and prove a failed click is safe to replay."""
+    snapshot = await tab.eval_js(GET_STATE_JS)
+    board = _validated_click_board(snapshot, expected, color, move)
+    if board is None:
+        raise RuntimeError(
+            "board changed after stale CDP mouse input; input was not replayed"
+        )
+    return snapshot, board
+
+
+def _promotion_point(value, context: str) -> tuple[float, float]:
+    """Return finite promotion coordinates or raise an actionable error."""
+    if not value:
+        raise RuntimeError(f"promotion choice disappeared {context}")
+    try:
+        point = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"promotion choice coordinates were invalid {context}"
+        ) from None
+    if len(point) != 2 or not all(math.isfinite(item) for item in point):
+        raise RuntimeError(f"promotion choice coordinates were invalid {context}")
+    return point
+
+
+async def _click_square_with_recovery(
+    tab: Tab,
+    square: str,
+    state: BrowserState,
+    board: chess.Board,
+    color: chess.Color,
+    move: chess.Move,
+) -> tuple[BrowserState, chess.Board]:
+    """Click one board square, replaying once after guarded CDP recovery."""
+    point = square_to_xy(
+        square,
+        tuple(state["rect"]),
+        board_white_bottom(state),
+    )
+    try:
+        await tab.click(*point)
+        return state, board
+    except CDPError as error:
+        if (
+            error.code != SESSION_NOT_FOUND_CODE
+            or not tab.supports_session_recovery
+        ):
+            raise
+
+    recovered_state, recovered_board = await _recover_click_board(
+        tab,
+        state,
+        color,
+        move,
+    )
+    recovered_point = square_to_xy(
+        square,
+        tuple(recovered_state["rect"]),
+        board_white_bottom(recovered_state),
+    )
+    await tab.click(*recovered_point)
+    return recovered_state, recovered_board
+
+
+async def _click_promotion_with_recovery(
+    tab: Tab,
+    point: tuple[float, float],
+    state: BrowserState,
+    board: chess.Board,
+    color: chess.Color,
+    move: chess.Move,
+) -> tuple[BrowserState, chess.Board]:
+    """Click a promotion choice, refreshing it before one guarded replay."""
+    try:
+        await tab.click(*point)
+        return state, board
+    except CDPError as error:
+        if (
+            error.code != SESSION_NOT_FOUND_CODE
+            or not tab.supports_session_recovery
+        ):
+            raise
+
+    recovered_state, recovered_board = await _recover_click_board(
+        tab,
+        state,
+        color,
+        move,
+    )
+    recovered_promo = await tab.eval_js(promotion_js(CONFIG.promotion_selector))
+    recovered_point = _promotion_point(recovered_promo, "after CDP recovery")
+    await tab.click(*recovered_point)
+    return recovered_state, recovered_board
 
 
 async def play(policy, color: chess.Color | None = None, dry_run=False, poll_s=0.4):
@@ -215,20 +364,13 @@ async def play(policy, color: chess.Color | None = None, dry_run=False, poll_s=0
             await asyncio.sleep(think_ms / 1000)
 
             fresh_state = await tab.eval_js(GET_STATE_JS)
-            if not fresh_state:
-                report_status("[replan] board disappeared while thinking")
-                continue
-            try:
-                fresh_board = board_from_state(fresh_state)
-            except ValueError as e:
-                report_status(f"[replan] board changed while thinking: {e}")
-                continue
-            if (
-                fresh_state.get("url") != state.get("url")
-                or fresh_state.get("moves") != state.get("moves")
-                or fresh_board.turn != session.resolved_color
-                or best_move not in fresh_board.legal_moves
-            ):
+            fresh_board = _validated_click_board(
+                fresh_state,
+                state,
+                session.resolved_color,
+                best_move,
+            )
+            if fresh_board is None:
                 report_status("[replan] position changed while thinking")
                 continue
             state = fresh_state
@@ -239,18 +381,70 @@ async def play(policy, color: chess.Color | None = None, dry_run=False, poll_s=0
                 session.last_played = ply
                 print(f"[dry-run] would play {best_move}; no click sent", flush=True)
                 continue
-            rect = tuple(state["rect"])
-            white_bottom = board_white_bottom(state)
-            x1, y1 = square_to_xy(chess.square_name(best_move.from_square), rect, white_bottom)
-            x2, y2 = square_to_xy(chess.square_name(best_move.to_square), rect, white_bottom)
-            await tab.click(x1, y1)
+            state, board = await _click_square_with_recovery(
+                tab,
+                chess.square_name(best_move.from_square),
+                state,
+                board,
+                session.resolved_color,
+                best_move,
+            )
+            ply = len(board.move_stack)
             await asyncio.sleep(random.uniform(0.10, 0.25))  # humanized pick→drop gap
-            await tab.click(x2, y2)
+
+            destination_state = await tab.eval_js(GET_STATE_JS)
+            destination_board = _validated_click_board(
+                destination_state,
+                state,
+                session.resolved_color,
+                best_move,
+            )
+            if destination_board is None:
+                report_status("[replan] position changed before destination click")
+                continue
+            state = destination_state
+            board = destination_board
+            ply = len(board.move_stack)
+            state, board = await _click_square_with_recovery(
+                tab,
+                chess.square_name(best_move.to_square),
+                state,
+                board,
+                session.resolved_color,
+                best_move,
+            )
+            ply = len(board.move_stack)
             await asyncio.sleep(0.5)
             promo = await tab.eval_js(promotion_js(CONFIG.promotion_selector))
             if promo:
-                px, py = (float(v) for v in promo)
-                await tab.click(px, py)  # trusted CDP click, NOT DOM .click()
+                promotion_state = await tab.eval_js(GET_STATE_JS)
+                promotion_board = _validated_click_board(
+                    promotion_state,
+                    state,
+                    session.resolved_color,
+                    best_move,
+                )
+                if promotion_board is None:
+                    raise RuntimeError(
+                        "position changed before promotion choice; stopping "
+                        "to avoid repeating a partially submitted move"
+                    )
+                refreshed_promo = await tab.eval_js(
+                    promotion_js(CONFIG.promotion_selector)
+                )
+                promotion_point = _promotion_point(
+                    refreshed_promo,
+                    "before click",
+                )
+                state, board = await _click_promotion_with_recovery(
+                    tab,
+                    promotion_point,
+                    promotion_state,
+                    promotion_board,
+                    session.resolved_color,
+                    best_move,
+                )
+                ply = len(board.move_stack)
             session.set_pending(
                 ply=ply,
                 deadline=time.monotonic() + CLICK_ACK_TIMEOUT_S,
